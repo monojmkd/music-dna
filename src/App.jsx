@@ -1,15 +1,24 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useCallback, useRef } from "react";
 
-// ─── PKCE Utilities ──────────────────────────────────────────────────────────────────────────
-function generateCodeVerifier(length = 128) {
+// ─── CONFIG ──────────────────────────────────────────────────────────────────
+// Developer sets these once. Users never see them.
+// For Vercel: set VITE_SPOTIFY_CLIENT_ID and VITE_REDIRECT_URI in dashboard.
+// For local dev: create .env file with same vars.
+const CLIENT_ID = import.meta.env.VITE_SPOTIFY_CLIENT_ID || "";
+const REDIRECT_URI =
+  import.meta.env.VITE_REDIRECT_URI || window.location.origin + "/";
+const SCOPES = "user-top-read user-read-private";
+
+// ─── PKCE Helpers ─────────────────────────────────────────────────────────────
+function generateVerifier(len = 128) {
   const chars =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
-  const array = new Uint8Array(length);
-  crypto.getRandomValues(array);
-  return Array.from(array, (b) => chars[b % chars.length]).join("");
+  const arr = new Uint8Array(len);
+  crypto.getRandomValues(arr);
+  return Array.from(arr, (b) => chars[b % chars.length]).join("");
 }
 
-async function generateCodeChallenge(verifier) {
+async function generateChallenge(verifier) {
   const data = new TextEncoder().encode(verifier);
   const digest = await crypto.subtle.digest("SHA-256", data);
   return btoa(String.fromCharCode(...new Uint8Array(digest)))
@@ -18,39 +27,12 @@ async function generateCodeChallenge(verifier) {
     .replace(/=/g, "");
 }
 
-// ─── Spotify API ─────────────────────────────────────────────────────────────────────────────
-const SPOTIFY_BASE = "https://api.spotify.com/v1";
-const SCOPES = "user-top-read user-read-private";
-const REDIRECT_URI = window.location.origin + window.location.pathname;
-
-async function spotifyFetch(endpoint, token) {
-  const res = await fetch(`${SPOTIFY_BASE}${endpoint}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!res.ok) throw new Error(`Spotify API ${res.status}: ${res.statusText}`);
-  return res.json();
-}
-
-async function fetchAllListeningData(token) {
-  const [tracksData, artistsData] = await Promise.all([
-    spotifyFetch("/me/top/tracks?limit=50&time_range=medium_term", token),
-    spotifyFetch("/me/top/artists?limit=50&time_range=medium_term", token),
-  ]);
-  const tracks = tracksData.items || [];
-  const artists = artistsData.items || [];
-  const ids = tracks.map((t) => t.id).join(",");
-  const featuresData = await spotifyFetch(`/audio-features?ids=${ids}`, token);
-  const features = (featuresData.audio_features || []).filter(Boolean);
-  return { tracks, artists, features };
-}
-
-async function initiateAuth(clientId) {
-  const verifier = generateCodeVerifier();
-  const challenge = await generateCodeChallenge(verifier);
+async function initiateLogin() {
+  const verifier = generateVerifier();
+  const challenge = await generateChallenge(verifier);
   sessionStorage.setItem("pkce_verifier", verifier);
-  sessionStorage.setItem("spotify_client_id", clientId);
   const params = new URLSearchParams({
-    client_id: clientId,
+    client_id: CLIENT_ID,
     response_type: "code",
     redirect_uri: REDIRECT_URI,
     scope: SCOPES,
@@ -60,28 +42,52 @@ async function initiateAuth(clientId) {
   window.location.href = `https://accounts.spotify.com/authorize?${params}`;
 }
 
-async function exchangeCodeForToken(code, clientId, verifier) {
+async function exchangeToken(code) {
+  const verifier = sessionStorage.getItem("pkce_verifier");
+  if (!verifier)
+    throw new Error("PKCE verifier missing — please try logging in again.");
   const res = await fetch("https://accounts.spotify.com/api/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
-      client_id: clientId,
+      client_id: CLIENT_ID,
       grant_type: "authorization_code",
       code,
       redirect_uri: REDIRECT_URI,
       code_verifier: verifier,
     }),
   });
-  if (!res.ok)
-    throw new Error(
-      "Token exchange failed — check your redirect URI and Client ID.",
-    );
+  if (!res.ok) throw new Error("Spotify login failed. Please try again.");
+  sessionStorage.removeItem("pkce_verifier");
   return res.json();
 }
 
-// ─── Personality Algorithm ───────────────────────────────────────────────────────────────────
+// ─── Spotify API ──────────────────────────────────────────────────────────────
+async function spGet(path, token) {
+  const res = await fetch(`https://api.spotify.com/v1${path}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (res.status === 401)
+    throw new Error("Session expired. Please log in again.");
+  if (!res.ok) throw new Error(`Spotify error ${res.status}`);
+  return res.json();
+}
 
-const GENRE_META_MAP = {
+async function fetchListeningData(token) {
+  const [tracksRes, artistsRes] = await Promise.all([
+    spGet("/me/top/tracks?limit=50&time_range=medium_term", token),
+    spGet("/me/top/artists?limit=50&time_range=medium_term", token),
+  ]);
+  const tracks = tracksRes.items || [];
+  const artists = artistsRes.items || [];
+  const ids = tracks.map((t) => t.id).join(",");
+  const featRes = await spGet(`/audio-features?ids=${ids}`, token);
+  const features = (featRes.audio_features || []).filter(Boolean);
+  return { tracks, artists, features };
+}
+
+// ─── Personality Engine ───────────────────────────────────────────────────────
+const GENRE_MAP = {
   electronic: "Electronic",
   edm: "Electronic",
   house: "Electronic",
@@ -94,8 +100,6 @@ const GENRE_META_MAP = {
   electro: "Electronic",
   dance: "Electronic",
   chillwave: "Electronic",
-  "future bass": "Electronic",
-  vapor: "Electronic",
   rock: "Rock & Alt",
   alternative: "Rock & Alt",
   indie: "Rock & Alt",
@@ -107,7 +111,6 @@ const GENRE_META_MAP = {
   emo: "Rock & Alt",
   hardcore: "Rock & Alt",
   "folk rock": "Rock & Alt",
-  "art rock": "Rock & Alt",
   "r&b": "R&B & Soul",
   soul: "R&B & Soul",
   "neo soul": "R&B & Soul",
@@ -126,21 +129,18 @@ const GENRE_META_MAP = {
   country: "Acoustic & Folk",
   bluegrass: "Acoustic & Folk",
   americana: "Acoustic & Folk",
-  "chamber pop": "Acoustic & Folk",
   classical: "Classical & Ambient",
   orchestral: "Classical & Ambient",
   jazz: "Classical & Ambient",
   piano: "Classical & Ambient",
   instrumental: "Classical & Ambient",
   "new age": "Classical & Ambient",
-  "post-classical": "Classical & Ambient",
   pop: "Pop",
   latin: "Pop",
   "k-pop": "Pop",
   "j-pop": "Pop",
   reggaeton: "Pop",
   dancehall: "Pop",
-  tropical: "Pop",
 };
 
 const GENRE_COLORS = {
@@ -154,16 +154,15 @@ const GENRE_COLORS = {
   Other: "#636e72",
 };
 
-// 12 Archetypes — each is an ideal-point vector in 8D space:
-// [Emotionality, Entropy/Chaos, Sociability, Nostalgia, Exploration, Mainstream, Drive/Intensity, Ether/Dreaminess]
+// 12 Archetypes — ideal-point vectors in 8D personality space
+// Dims: [Emotionality, Chaos, Sociability, Nostalgia, Exploration, Mainstream, Drive, Ether]
 const ARCHETYPES = [
   {
     id: "midnight_drifter",
     name: "Midnight Drifter",
     emoji: "🌙",
     tagline: "You feel everything twice.",
-    description:
-      "Music is your emotional processing system. You gravitate toward songs that articulate things you can't say out loud. Late nights, low volume, high feeling.",
+    desc: "Music is your emotional processing system. You gravitate toward songs that articulate things you can't say out loud. Late nights, low volume, high feeling.",
     profile: [85, 30, 25, 55, 65, 30, 40, 60],
     color: "#9d4edd",
   },
@@ -172,8 +171,7 @@ const ARCHETYPES = [
     name: "Sonic Rebel",
     emoji: "⚡",
     tagline: "You don't listen to music. You survive it.",
-    description:
-      "High energy, genre-agnostic chaos. You need music that matches your internal voltage. Rules, structures, genres — all exist to be distorted.",
+    desc: "High energy, genre-agnostic chaos. You need music that matches your internal voltage. Rules and structures exist to be distorted.",
     profile: [60, 80, 35, 25, 80, 20, 85, 15],
     color: "#ff4757",
   },
@@ -182,8 +180,7 @@ const ARCHETYPES = [
     name: "Velvet Romantic",
     emoji: "🥀",
     tagline: "You've built a whole world inside three chords.",
-    description:
-      "Deeply emotional, socially warm. R&B, soul, emotional pop. You believe a song should feel like being held by someone who truly understands.",
+    desc: "Deeply emotional, socially warm. R&B, soul, emotional pop. You believe a song should feel like being held by someone who truly understands.",
     profile: [90, 20, 60, 50, 30, 55, 30, 40],
     color: "#e91e8c",
   },
@@ -192,8 +189,7 @@ const ARCHETYPES = [
     name: "Neon Runner",
     emoji: "🏃",
     tagline: "Music is fuel. Everything else is noise.",
-    description:
-      "Function over feeling. BPM is your currency. Your playlist is precision-engineered for momentum — gym sets, commutes, personal records.",
+    desc: "Function over feeling. BPM is your currency. Your playlist is precision-engineered for momentum — gym, commute, personal records.",
     profile: [25, 50, 80, 10, 45, 70, 95, 10],
     color: "#06b6d4",
   },
@@ -202,8 +198,7 @@ const ARCHETYPES = [
     name: "Cosmic Dreamer",
     emoji: "🌌",
     tagline: "You listen to music that doesn't exist yet.",
-    description:
-      "Ambient, experimental, instrumental. You treat music as a portal, not entertainment. Maximum genre diversity, minimum mainstream. Sound over song.",
+    desc: "Ambient, experimental, instrumental. You treat music as a portal, not entertainment. Sound over song. Maximum diversity, minimum mainstream.",
     profile: [50, 60, 15, 30, 90, 15, 25, 90],
     color: "#4361ee",
   },
@@ -212,8 +207,7 @@ const ARCHETYPES = [
     name: "Chaos Curator",
     emoji: "🎲",
     tagline: "Your shuffle would give an algorithm an existential crisis.",
-    description:
-      "Truly genre-fluid. Classical to drill to bossa nova in three songs. You actively resist the idea of having a type — because you contain all types.",
+    desc: "Truly genre-fluid. Classical to drill to bossa nova in three songs. You don't have a type — you contain all types.",
     profile: [40, 95, 50, 35, 95, 40, 55, 35],
     color: "#f7931e",
   },
@@ -222,8 +216,7 @@ const ARCHETYPES = [
     name: "Nostalgia Architect",
     emoji: "📼",
     tagline: "You're building a museum, one playlist at a time.",
-    description:
-      "Drawn to older recordings, acoustic textures, familiar song structures. The past isn't where you live — it's what you trust. Every era had better B-sides.",
+    desc: "Drawn to older recordings, acoustic textures, familiar structures. The past isn't where you live — it's what you trust.",
     profile: [65, 25, 45, 95, 25, 45, 35, 50],
     color: "#d4a017",
   },
@@ -232,8 +225,7 @@ const ARCHETYPES = [
     name: "Café Philosopher",
     emoji: "☕",
     tagline: "You have opinions about reverb.",
-    description:
-      "Jazz, acoustic, lo-fi, singer-songwriter. Music is simultaneously background and foreground. Deeply intentional. You notice the room's acoustics before the menu.",
+    desc: "Jazz, acoustic, lo-fi, singer-songwriter. Music is simultaneously background and foreground. Deeply intentional listening.",
     profile: [55, 30, 30, 60, 55, 35, 20, 70],
     color: "#2dc653",
   },
@@ -242,8 +234,7 @@ const ARCHETYPES = [
     name: "The Hype Machine",
     emoji: "📣",
     tagline: "If it's not a banger, what even is the point.",
-    description:
-      "Chart-dominant, high popularity, maximum danceability. You're not chasing trends — you are the trend, three weeks before anyone else notices.",
+    desc: "Chart-dominant, high popularity, maximum danceability. You're not chasing trends — you are the trend, three weeks before anyone else.",
     profile: [20, 55, 90, 15, 30, 95, 80, 5],
     color: "#c77dff",
   },
@@ -252,8 +243,7 @@ const ARCHETYPES = [
     name: "Phantom Aesthete",
     emoji: "🎭",
     tagline: "You listen like a critic, feel like a poet.",
-    description:
-      "Underground, genre-selective, instrumentally complex. Low mainstream pull, impossibly high sonic standards. Hard to impress, harder still to bore.",
+    desc: "Underground, genre-selective, instrumentally complex. Low mainstream pull, impossibly high sonic standards. Hard to impress.",
     profile: [70, 40, 20, 45, 70, 10, 45, 85],
     color: "#0f9b8e",
   },
@@ -262,8 +252,7 @@ const ARCHETYPES = [
     name: "Lone Wolf",
     emoji: "🐺",
     tagline: "Your taste is a locked room only you have the key to.",
-    description:
-      "Deeply personal, non-social music choices. Eclectic underground selections that feel autobiographical. Music as identity, not conversation.",
+    desc: "Deeply personal, non-social choices. Eclectic underground selections that feel autobiographical. Music as identity, not conversation.",
     profile: [75, 70, 15, 40, 85, 15, 60, 65],
     color: "#8d99ae",
   },
@@ -272,25 +261,19 @@ const ARCHETYPES = [
     name: "Solar Architect",
     emoji: "🔆",
     tagline: "You make the energy in the room.",
-    description:
-      "Upbeat, diverse, socially calibrated. Your music makes things happen. Parties, workouts, good moods — you are the soundtrack person.",
+    desc: "Upbeat, diverse, socially calibrated. Your music makes things happen — parties, workouts, good moods. You are the soundtrack person.",
     profile: [30, 45, 65, 20, 60, 60, 70, 30],
     color: "#ff7b00",
   },
 ];
 
-// ─── Algorithm helpers ───────────────────────────────────────────────────────────────────────
-function mean(arr) {
-  return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
-}
-function stddev(arr) {
-  if (arr.length < 2) return 0;
-  const m = mean(arr);
-  return Math.sqrt(mean(arr.map((x) => (x - m) ** 2)));
-}
-function clamp(v, lo = 0, hi = 100) {
-  return Math.max(lo, Math.min(hi, v));
-}
+const mean = (a) => (a.length ? a.reduce((s, v) => s + v, 0) / a.length : 0);
+const stddev = (a) => {
+  if (a.length < 2) return 0;
+  const m = mean(a);
+  return Math.sqrt(mean(a.map((x) => (x - m) ** 2)));
+};
+const clamp = (v, lo = 0, hi = 100) => Math.max(lo, Math.min(hi, v));
 
 function scoreDimensions(tracks, artists, features) {
   const val = features.map((f) => f.valence);
@@ -309,9 +292,9 @@ function scoreDimensions(tracks, artists, features) {
   const genreCounts = {};
   for (const g of allGenres) genreCounts[g] = (genreCounts[g] || 0) + 1;
   const uniqueCount = Object.keys(genreCounts).length;
-
-  // Shannon entropy of genre distribution → measures listening breadth
   const totalG = allGenres.length || 1;
+
+  // Shannon entropy → genre breadth
   let shannonH = 0;
   for (const c of Object.values(genreCounts)) {
     const p = c / totalG;
@@ -322,7 +305,6 @@ function scoreDimensions(tracks, artists, features) {
     shannonH / Math.log2(Math.max(uniqueCount, 2)),
   );
 
-  // Social genre affinity — how much of listening is crowd-oriented
   const socialWords = [
     "pop",
     "hip hop",
@@ -337,35 +319,20 @@ function scoreDimensions(tracks, artists, features) {
     allGenres.filter((g) => socialWords.some((w) => g.includes(w))).length /
     totalG;
 
-  // 1. EMOTIONALITY — low valence = high emotional depth
   const EQ = clamp(
     (1 - mean(val)) * 100 + (mean(features.map((f) => f.mode)) < 0.4 ? 8 : 0),
   );
-
-  // 2. CHAOS — energy variance across tracks + genre distribution entropy
   const Entropy = clamp(stddev(nrg) * 175 + genreEntropy * 48);
-
-  // 3. SOCIABILITY — danceability as proxy for communal listening intent
   const Social = clamp(mean(dnc) * 70 + socialBonus * 30);
-
-  // 4. NOSTALGIA — weighted release year recency, boosted by acoustic texture
   const avgYear = mean(yrs);
   const Nostalgia = clamp(
     (Math.max(0, 2024 - avgYear) / 28) * 82 + (mean(aco) > 0.5 ? 12 : 0),
   );
-
-  // 5. EXPLORATION — unique genre count + underground bias (inverse popularity)
   const Explore = clamp(
     (Math.min(uniqueCount, 30) / 30) * 55 + (1 - mean(pop) / 100) * 45,
   );
-
-  // 6. MAINSTREAM PULL — raw Spotify popularity score
   const Pop = clamp(mean(pop));
-
-  // 7. DRIVE / INTENSITY — tempo normalized to 60–200bpm range, blended with energy
   const Drive = clamp(((mean(tmp) - 60) / 140) * 50 + mean(nrg) * 50);
-
-  // 8. DREAMINESS / ETHER — instrumentalness + acousticness as portals; speechiness as anchor
   const Ether = clamp(mean(ins) * 55 + mean(aco) * 30 - mean(sph) * 25 + 18);
 
   return {
@@ -381,7 +348,6 @@ function scoreDimensions(tracks, artists, features) {
 }
 
 function classifyArchetype(dims) {
-  // Weighted Euclidean distance — heavier weight on most distinctive dimensions
   const user = [
     dims.emotionality,
     dims.entropy,
@@ -394,21 +360,21 @@ function classifyArchetype(dims) {
   ];
   const W = [1.5, 1.2, 1.0, 1.0, 1.3, 0.8, 1.1, 1.2];
   const scored = ARCHETYPES.map((a) => ({
-    arch: a,
-    dist: Math.sqrt(
+    a,
+    d: Math.sqrt(
       a.profile.reduce((s, v, i) => s + W[i] * (user[i] - v) ** 2, 0),
     ),
-  })).sort((a, b) => a.dist - b.dist);
-  return { primary: scored[0].arch, secondary: scored[1].arch };
+  })).sort((x, y) => x.d - y.d);
+  return { primary: scored[0].a, secondary: scored[1].a };
 }
 
 function buildGenreDNA(artists) {
   const meta = {};
-  for (const genre of artists.flatMap((a) => a.genres || [])) {
+  for (const g of artists.flatMap((a) => a.genres || [])) {
     let group = "Other";
-    for (const [key, val] of Object.entries(GENRE_META_MAP)) {
-      if (genre.toLowerCase().includes(key)) {
-        group = val;
+    for (const [k, v] of Object.entries(GENRE_MAP)) {
+      if (g.toLowerCase().includes(k)) {
+        group = v;
         break;
       }
     }
@@ -452,32 +418,30 @@ function analyzeAll(tracks, artists, features) {
   return { dims, primary, secondary, genreDNA, moodSpectrum, stats };
 }
 
-// ─── SVG: Radar (Mood Spectrum) ──────────────────────────────────────────────────────────────
+// ─── SVG: Radar Chart ─────────────────────────────────────────────────────────
 function RadarChart({ axes, color }) {
   const CX = 150,
     CY = 150,
-    R = 108;
-  const N = axes.length;
+    R = 105,
+    N = axes.length;
   const ang = (i) => (2 * Math.PI * i) / N - Math.PI / 2;
   const pt = (val, i) => {
     const d = (val / 100) * R;
     return [CX + d * Math.cos(ang(i)), CY + d * Math.sin(ang(i))];
   };
-  const dataPts = axes.map((a, i) => pt(a.value, i));
-  const polyStr = dataPts.map((p) => p.join(",")).join(" ");
-  const gridLvls = [0.25, 0.5, 0.75, 1];
-
+  const pts = axes.map((a, i) => pt(a.value, i));
+  const poly = pts.map((p) => p.join(",")).join(" ");
   return (
     <svg
       viewBox="0 0 300 300"
       style={{
         width: "100%",
-        maxWidth: 280,
-        filter: `drop-shadow(0 0 22px ${color}44)`,
+        maxWidth: 270,
+        filter: `drop-shadow(0 0 20px ${color}44)`,
       }}
     >
-      {gridLvls.map((lvl) => {
-        const pts = axes
+      {[0.25, 0.5, 0.75, 1].map((lvl) => {
+        const gp = axes
           .map((_, i) => {
             const a = ang(i);
             return [
@@ -489,7 +453,7 @@ function RadarChart({ axes, color }) {
         return (
           <polygon
             key={lvl}
-            points={pts}
+            points={gp}
             fill="none"
             stroke="rgba(255,255,255,0.07)"
             strokeWidth="1"
@@ -503,19 +467,19 @@ function RadarChart({ axes, color }) {
           y1={CY}
           x2={CX + R * Math.cos(ang(i))}
           y2={CY + R * Math.sin(ang(i))}
-          stroke="rgba(255,255,255,0.08)"
+          stroke="rgba(255,255,255,0.07)"
           strokeWidth="1"
         />
       ))}
       <polygon
-        points={polyStr}
+        points={poly}
         fill={`${color}28`}
         stroke={color}
         strokeWidth="2.5"
         strokeLinejoin="round"
         style={{ filter: `drop-shadow(0 0 10px ${color})` }}
       />
-      {dataPts.map(([x, y], i) => (
+      {pts.map(([x, y], i) => (
         <circle
           key={i}
           cx={x}
@@ -526,8 +490,8 @@ function RadarChart({ axes, color }) {
         />
       ))}
       {axes.map((a, i) => {
-        const lx = CX + (R + 24) * Math.cos(ang(i));
-        const ly = CY + (R + 24) * Math.sin(ang(i));
+        const lx = CX + (R + 26) * Math.cos(ang(i)),
+          ly = CY + (R + 26) * Math.sin(ang(i));
         return (
           <text
             key={i}
@@ -535,8 +499,8 @@ function RadarChart({ axes, color }) {
             y={ly}
             textAnchor="middle"
             dominantBaseline="middle"
-            fill="rgba(255,255,255,0.6)"
-            fontSize="9.5"
+            fill="rgba(255,255,255,0.58)"
+            fontSize="9"
             fontFamily="'Space Mono',monospace"
             fontWeight="700"
           >
@@ -544,7 +508,7 @@ function RadarChart({ axes, color }) {
           </text>
         );
       })}
-      {dataPts.map(([x, y], i) => (
+      {pts.map(([x, y], i) => (
         <text
           key={`v${i}`}
           x={x}
@@ -563,32 +527,32 @@ function RadarChart({ axes, color }) {
   );
 }
 
-// ─── SVG: Donut Chart (Genre DNA) ───────────────────────────────────────────────────────────
+// ─── SVG: Donut Chart ─────────────────────────────────────────────────────────
 function DonutChart({ data }) {
   const CX = 90,
     CY = 90,
     OR = 70,
     IR = 46;
-  let start = -Math.PI / 2;
   const GAP = 0.03;
-  const slices = data.map((d) => {
-    const sweep = (d.pct / 100) * 2 * Math.PI - GAP;
-    const s = { ...d, start, sweep };
-    start += sweep + GAP;
-    return s;
-  });
-  const arc = (s, sw, outer, inner) => {
+  // Use reduce so we never mutate a variable after render (satisfies react-hooks/immutability)
+  const slices = data.reduce((acc, d) => {
+    const prev = acc[acc.length - 1];
+    const start = prev ? prev.start + prev.sw + GAP : -Math.PI / 2;
+    const sw = (d.pct / 100) * 2 * Math.PI - GAP;
+    return [...acc, { ...d, start, sw }];
+  }, []);
+  const arc = (s, sw, O, I) => {
     const ea = s + sw,
       lg = sw > Math.PI ? 1 : 0;
-    const x1 = CX + outer * Math.cos(s),
-      y1 = CY + outer * Math.sin(s);
-    const x2 = CX + outer * Math.cos(ea),
-      y2 = CY + outer * Math.sin(ea);
-    const x3 = CX + inner * Math.cos(ea),
-      y3 = CY + inner * Math.sin(ea);
-    const x4 = CX + inner * Math.cos(s),
-      y4 = CY + inner * Math.sin(s);
-    return `M${x1},${y1} A${outer},${outer} 0 ${lg} 1 ${x2},${y2} L${x3},${y3} A${inner},${inner} 0 ${lg} 0 ${x4},${y4} Z`;
+    const x1 = CX + O * Math.cos(s),
+      y1 = CY + O * Math.sin(s),
+      x2 = CX + O * Math.cos(ea),
+      y2 = CY + O * Math.sin(ea);
+    const x3 = CX + I * Math.cos(ea),
+      y3 = CY + I * Math.sin(ea),
+      x4 = CX + I * Math.cos(s),
+      y4 = CY + I * Math.sin(s);
+    return `M${x1},${y1} A${O},${O} 0 ${lg} 1 ${x2},${y2} L${x3},${y3} A${I},${I} 0 ${lg} 0 ${x4},${y4} Z`;
   };
   return (
     <div
@@ -601,12 +565,12 @@ function DonutChart({ data }) {
     >
       <svg
         viewBox="0 0 180 180"
-        style={{ width: 140, height: 140, flexShrink: 0 }}
+        style={{ width: 136, height: 136, flexShrink: 0 }}
       >
         {slices.map((s, i) => (
           <path
             key={i}
-            d={arc(s.start, s.sweep, OR, IR)}
+            d={arc(s.start, s.sw, OR, IR)}
             fill={s.color}
             opacity={0.88}
             style={{ filter: `drop-shadow(0 0 5px ${s.color}88)` }}
@@ -665,10 +629,10 @@ function DonutChart({ data }) {
                 fontSize: 9.5,
                 color: "rgba(255,255,255,0.6)",
                 fontFamily: "Space Mono",
-                whiteSpace: "nowrap",
+                flex: 1,
                 overflow: "hidden",
                 textOverflow: "ellipsis",
-                flex: 1,
+                whiteSpace: "nowrap",
               }}
             >
               {d.name}
@@ -690,7 +654,7 @@ function DonutChart({ data }) {
   );
 }
 
-// ─── Component: Dimension Bar ────────────────────────────────────────────────────────────────
+// ─── Component: Dim Bar ───────────────────────────────────────────────────────
 function DimBar({ label, value, color, icon }) {
   return (
     <div style={{ marginBottom: 9 }}>
@@ -705,7 +669,7 @@ function DimBar({ label, value, color, icon }) {
         <span
           style={{
             fontSize: 9.5,
-            color: "rgba(255,255,255,0.52)",
+            color: "rgba(255,255,255,0.5)",
             fontFamily: "Space Mono",
             display: "flex",
             gap: 5,
@@ -739,7 +703,7 @@ function DimBar({ label, value, color, icon }) {
             width: `${value}%`,
             height: "100%",
             borderRadius: 2,
-            background: `linear-gradient(90deg, ${color}55, ${color})`,
+            background: `linear-gradient(90deg,${color}55,${color})`,
             boxShadow: `0 0 8px ${color}55`,
           }}
         />
@@ -748,17 +712,8 @@ function DimBar({ label, value, color, icon }) {
   );
 }
 
-// ─── Screen: Setup ───────────────────────────────────────────────────────────────────────────
-function SetupScreen({ onConnect }) {
-  const [clientId, setClientId] = useState("");
-  const [copied, setCopied] = useState(false);
-
-  const copyUri = () => {
-    navigator.clipboard?.writeText(REDIRECT_URI);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
+// ─── Screen: Login ────────────────────────────────────────────────────────────
+function LoginScreen({ onLogin, noClientId }) {
   return (
     <div
       style={{
@@ -767,14 +722,15 @@ function SetupScreen({ onConnect }) {
         flexDirection: "column",
         alignItems: "center",
         justifyContent: "center",
+        fontFamily: "'Space Mono',monospace",
         background:
           "radial-gradient(ellipse at 25% 40%, #1e0b3d 0%, #0b0b18 55%, #0a1628 100%)",
         padding: "24px 16px",
-        fontFamily: "'Space Mono', monospace",
         position: "relative",
         overflow: "hidden",
       }}
     >
+      {/* Ambient orbs */}
       <div
         style={{
           position: "fixed",
@@ -784,7 +740,7 @@ function SetupScreen({ onConnect }) {
           height: 480,
           borderRadius: "50%",
           background:
-            "radial-gradient(circle, rgba(157,78,237,0.12) 0%, transparent 65%)",
+            "radial-gradient(circle,rgba(157,78,237,.12) 0%,transparent 65%)",
           pointerEvents: "none",
         }}
       />
@@ -797,65 +753,76 @@ function SetupScreen({ onConnect }) {
           height: 380,
           borderRadius: "50%",
           background:
-            "radial-gradient(circle, rgba(6,182,212,0.08) 0%, transparent 65%)",
+            "radial-gradient(circle,rgba(6,182,212,.08) 0%,transparent 65%)",
           pointerEvents: "none",
         }}
       />
 
       <div
         style={{
-          maxWidth: 460,
+          maxWidth: 400,
           width: "100%",
+          textAlign: "center",
           position: "relative",
           zIndex: 1,
         }}
       >
-        <div style={{ textAlign: "center", marginBottom: 34 }}>
-          <div
-            style={{
-              fontSize: 50,
-              marginBottom: 10,
-              filter: "drop-shadow(0 0 22px rgba(157,78,237,0.65))",
-            }}
-          >
-            🎵
-          </div>
-          <h1
-            style={{
-              margin: 0,
-              fontSize: 34,
-              fontWeight: "700",
-              color: "white",
-              letterSpacing: "-1px",
-              lineHeight: 1,
-            }}
-          >
-            Music
-            <span
-              style={{ color: "#9d4edd", textShadow: "0 0 22px #9d4edd88" }}
-            >
-              DNA
-            </span>
-          </h1>
-          <p
-            style={{
-              color: "rgba(255,255,255,0.35)",
-              fontSize: 11,
-              marginTop: 7,
-              letterSpacing: 3,
-            }}
-          >
-            PERSONALITY PROFILER
-          </p>
+        {/* Logo */}
+        <div
+          style={{
+            fontSize: 56,
+            marginBottom: 14,
+            filter: "drop-shadow(0 0 24px rgba(157,78,237,.65))",
+          }}
+        >
+          🎵
         </div>
+        <h1
+          style={{
+            margin: "0 0 6px",
+            fontSize: 36,
+            fontWeight: 700,
+            color: "white",
+            letterSpacing: "-1px",
+          }}
+        >
+          Music
+          <span style={{ color: "#9d4edd", textShadow: "0 0 24px #9d4edd88" }}>
+            DNA
+          </span>
+        </h1>
+        <p
+          style={{
+            color: "rgba(255,255,255,.35)",
+            fontSize: 11,
+            letterSpacing: 3,
+            margin: "0 0 10px",
+          }}
+        >
+          PERSONALITY PROFILER
+        </p>
+        <p
+          style={{
+            color: "rgba(255,255,255,.5)",
+            fontSize: 12,
+            lineHeight: 1.75,
+            margin: "0 0 32px",
+            maxWidth: 340,
+            display: "inline-block",
+          }}
+        >
+          Discover your music archetype, mood spectrum, and alter ego — all from
+          your real Spotify listening data.
+        </p>
 
+        {/* Feature chips */}
         <div
           style={{
             display: "flex",
-            gap: 7,
+            gap: 8,
             flexWrap: "wrap",
             justifyContent: "center",
-            marginBottom: 30,
+            marginBottom: 36,
           }}
         >
           {[
@@ -870,9 +837,9 @@ function SetupScreen({ onConnect }) {
                 fontSize: 11,
                 padding: "5px 12px",
                 borderRadius: 20,
-                border: "1px solid rgba(157,78,237,0.28)",
-                color: "rgba(255,255,255,0.5)",
-                background: "rgba(157,78,237,0.07)",
+                border: "1px solid rgba(157,78,237,.28)",
+                color: "rgba(255,255,255,.5)",
+                background: "rgba(157,78,237,.07)",
               }}
             >
               {t}
@@ -880,218 +847,112 @@ function SetupScreen({ onConnect }) {
           ))}
         </div>
 
-        <div
-          style={{
-            background: "rgba(255,255,255,0.032)",
-            border: "1px solid rgba(255,255,255,0.09)",
-            borderRadius: 18,
-            padding: "24px 24px",
-            backdropFilter: "blur(16px)",
-          }}
-        >
-          <p
+        {noClientId ? (
+          /* Dev forgot to set env var */
+          <div
             style={{
-              color: "rgba(255,255,255,0.62)",
-              fontSize: 12,
-              lineHeight: 1.8,
-              margin: "0 0 20px",
+              background: "rgba(255,71,87,.08)",
+              border: "1px solid rgba(255,71,87,.3)",
+              borderRadius: 14,
+              padding: "20px 24px",
+              marginBottom: 20,
             }}
           >
-            Uses{" "}
-            <span style={{ color: "#9d4edd", fontWeight: "bold" }}>
-              PKCE OAuth
-            </span>{" "}
-            — zero servers, fully in-browser. You need a free Spotify Developer
-            app (2 minutes).
-          </p>
-
-          <div style={{ marginBottom: 16 }}>
-            <label
+            <p
               style={{
-                fontSize: 9,
-                color: "rgba(255,255,255,0.38)",
-                letterSpacing: 2.5,
-                display: "block",
-                marginBottom: 7,
+                color: "#ff4757",
+                fontSize: 12,
+                lineHeight: 1.75,
+                margin: 0,
               }}
             >
-              STEP 1 — COPY THIS AS YOUR REDIRECT URI
-            </label>
-            <div
-              onClick={copyUri}
-              style={{
-                background: "rgba(0,0,0,0.42)",
-                border: "1px solid rgba(157,78,237,0.32)",
-                borderRadius: 9,
-                padding: "10px 13px",
-                fontSize: 11,
-                color: "#b07ff5",
-                wordBreak: "break-all",
-                cursor: "pointer",
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "flex-start",
-                gap: 8,
-              }}
-            >
-              <span>{REDIRECT_URI}</span>
-              <span
+              ⚠️ <strong>Developer setup required.</strong>
+              <br />
+              Set{" "}
+              <code
                 style={{
-                  flexShrink: 0,
-                  color: copied ? "#2dc653" : "rgba(255,255,255,0.3)",
-                  fontSize: 14,
-                  transition: "color 0.2s",
+                  background: "rgba(255,255,255,.1)",
+                  padding: "2px 6px",
+                  borderRadius: 4,
                 }}
               >
-                {copied ? "✓" : "📋"}
-              </span>
-            </div>
+                VITE_SPOTIFY_CLIENT_ID
+              </code>{" "}
+              in your <code>.env</code> or Vercel dashboard.
+              <br />
+              <a
+                href="https://developer.spotify.com/dashboard"
+                target="_blank"
+                rel="noreferrer"
+                style={{ color: "#ff8fa0", fontSize: 11 }}
+              >
+                → developer.spotify.com/dashboard
+              </a>
+            </p>
           </div>
-
-          <div style={{ marginBottom: 20 }}>
-            <label
-              style={{
-                fontSize: 9,
-                color: "rgba(255,255,255,0.38)",
-                letterSpacing: 2.5,
-                display: "block",
-                marginBottom: 7,
-              }}
-            >
-              STEP 2 — PASTE YOUR CLIENT ID
-            </label>
-            <input
-              type="text"
-              value={clientId}
-              onChange={(e) => setClientId(e.target.value)}
-              placeholder="e.g. 4ae4a3f9d1c84b2e..."
-              style={{
-                width: "100%",
-                background: "rgba(0,0,0,0.38)",
-                border: "1px solid rgba(255,255,255,0.11)",
-                borderRadius: 9,
-                padding: "11px 13px",
-                color: "white",
-                fontSize: 13,
-                outline: "none",
-                boxSizing: "border-box",
-                fontFamily: "Space Mono",
-              }}
-              onFocus={(e) =>
-                (e.target.style.borderColor = "rgba(157,78,237,0.55)")
-              }
-              onBlur={(e) =>
-                (e.target.style.borderColor = "rgba(255,255,255,0.11)")
-              }
-            />
-          </div>
-
+        ) : (
+          /* Normal user sees only this */
           <button
-            onClick={() => onConnect(clientId.trim())}
-            disabled={!clientId.trim()}
+            onClick={onLogin}
             style={{
-              width: "100%",
-              padding: "13px",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 12,
+              padding: "16px 40px",
               fontFamily: "Space Mono",
-              background: clientId.trim()
-                ? "linear-gradient(135deg, #7c3aed, #4f46e5)"
-                : "rgba(255,255,255,0.06)",
+              fontWeight: 700,
+              fontSize: 14,
+              letterSpacing: 1.5,
+              cursor: "pointer",
               border: "none",
-              borderRadius: 11,
-              color: clientId.trim() ? "white" : "rgba(255,255,255,0.22)",
-              fontSize: 12,
-              fontWeight: "bold",
-              letterSpacing: 2,
-              cursor: clientId.trim() ? "pointer" : "not-allowed",
-              boxShadow: clientId.trim()
-                ? "0 0 32px rgba(124,58,237,0.45)"
-                : "none",
-              transition: "all 0.3s ease",
+              borderRadius: 50,
+              color: "white",
+              background: "linear-gradient(135deg,#1db954 0%,#1ed760 100%)",
+              boxShadow: "0 0 40px rgba(29,185,84,.5)",
+              transition: "all .25s ease",
+            }}
+            onMouseOver={(e) => {
+              e.currentTarget.style.transform = "scale(1.04)";
+              e.currentTarget.style.boxShadow = "0 0 55px rgba(29,185,84,.65)";
+            }}
+            onMouseOut={(e) => {
+              e.currentTarget.style.transform = "scale(1)";
+              e.currentTarget.style.boxShadow = "0 0 40px rgba(29,185,84,.5)";
             }}
           >
-            CONNECT SPOTIFY →
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="white">
+              <path d="M12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2zm4.586 14.424a.623.623 0 01-.857.207c-2.348-1.435-5.304-1.76-8.785-.964a.623.623 0 01-.277-1.215c3.809-.87 7.077-.496 9.712 1.115a.623.623 0 01.207.857zm1.223-2.722a.779.779 0 01-1.072.257c-2.687-1.652-6.785-2.131-9.965-1.166a.779.779 0 01-.456-1.489c3.633-1.115 8.147-.574 11.236 1.326a.779.779 0 01.257 1.072zm.105-2.835C14.692 8.95 9.375 8.775 6.297 9.71a.935.935 0 11-.543-1.79c3.532-1.072 9.404-.865 13.115 1.338a.935.935 0 01-.955 1.609z" />
+            </svg>
+            LOGIN WITH SPOTIFY
           </button>
-        </div>
+        )}
 
-        <div
+        <p
           style={{
-            marginTop: 20,
-            display: "flex",
-            flexDirection: "column",
-            gap: 8,
+            color: "rgba(255,255,255,.2)",
+            fontSize: 10,
+            letterSpacing: 1,
+            marginTop: 18,
           }}
         >
-          {[
-            [
-              "1",
-              "Visit",
-              "developer.spotify.com/dashboard",
-              "https://developer.spotify.com/dashboard",
-            ],
-            ["2", "Create App → add Redirect URI above → save"],
-            ["3", "Copy Client ID → paste above → Connect"],
-          ].map((s) => (
-            <div
-              key={s[0]}
-              style={{ display: "flex", gap: 11, alignItems: "flex-start" }}
-            >
-              <div
-                style={{
-                  width: 18,
-                  height: 18,
-                  borderRadius: "50%",
-                  background: "rgba(157,78,237,0.14)",
-                  border: "1px solid rgba(157,78,237,0.32)",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  flexShrink: 0,
-                  fontSize: 9,
-                  color: "#9d4edd",
-                  fontWeight: "bold",
-                }}
-              >
-                {s[0]}
-              </div>
-              <span
-                style={{
-                  fontSize: 11,
-                  color: "rgba(255,255,255,0.38)",
-                  lineHeight: 1.6,
-                }}
-              >
-                {s[1]}{" "}
-                {s[2] && (
-                  <a
-                    href={s[3]}
-                    target="_blank"
-                    rel="noreferrer"
-                    style={{ color: "#9d4edd" }}
-                  >
-                    {s[2]}
-                  </a>
-                )}
-              </span>
-            </div>
-          ))}
-        </div>
+          Read-only access · No data stored · Works with free Spotify accounts
+        </p>
       </div>
 
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&display=swap');
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        input::placeholder { color: rgba(255,255,255,0.2); }
+        *{box-sizing:border-box;margin:0;padding:0;}
       `}</style>
     </div>
   );
 }
 
-// ─── Screen: Loading ─────────────────────────────────────────────────────────────────────────
+// ─── Screen: Loading ──────────────────────────────────────────────────────────
 function LoadingScreen({ stage }) {
   const stages = [
-    { label: "Exchanging auth token...", icon: "🔑" },
+    { label: "Connecting to Spotify...", icon: "🔑" },
     { label: "Fetching your top tracks...", icon: "🎵" },
-    { label: "Pulling audio features...", icon: "🔬" },
+    { label: "Analysing audio features...", icon: "🔬" },
     { label: "Scoring personality dimensions...", icon: "🧠" },
     { label: "Classifying your archetype...", icon: "🎭" },
     { label: "Rendering your profile...", icon: "✨" },
@@ -1106,9 +967,9 @@ function LoadingScreen({ stage }) {
         flexDirection: "column",
         alignItems: "center",
         justifyContent: "center",
-        background:
-          "radial-gradient(ellipse at 25% 40%, #1e0b3d 0%, #0b0b18 55%, #0a1628 100%)",
         fontFamily: "Space Mono",
+        background:
+          "radial-gradient(ellipse at 25% 40%,#1e0b3d 0%,#0b0b18 55%,#0a1628 100%)",
       }}
     >
       <div style={{ textAlign: "center", padding: 24 }}>
@@ -1125,7 +986,7 @@ function LoadingScreen({ stage }) {
           style={{
             width: 220,
             height: 3,
-            background: "rgba(255,255,255,0.08)",
+            background: "rgba(255,255,255,.08)",
             borderRadius: 2,
             margin: "0 auto 13px",
             overflow: "hidden",
@@ -1135,16 +996,16 @@ function LoadingScreen({ stage }) {
             style={{
               height: "100%",
               borderRadius: 2,
-              background: "linear-gradient(90deg, #7c3aed, #a78bfa)",
+              background: "linear-gradient(90deg,#7c3aed,#a78bfa)",
               width: `${pct}%`,
-              transition: "width 0.6s ease",
-              boxShadow: "0 0 12px rgba(167,139,250,0.55)",
+              transition: "width .6s ease",
+              boxShadow: "0 0 12px rgba(167,139,250,.55)",
             }}
           />
         </div>
         <p
           style={{
-            color: "rgba(255,255,255,0.48)",
+            color: "rgba(255,255,255,.48)",
             fontSize: 12,
             letterSpacing: 1,
           }}
@@ -1153,7 +1014,7 @@ function LoadingScreen({ stage }) {
         </p>
         <p
           style={{
-            color: "rgba(255,255,255,0.18)",
+            color: "rgba(255,255,255,.2)",
             fontSize: 10,
             letterSpacing: 2,
             marginTop: 5,
@@ -1162,13 +1023,13 @@ function LoadingScreen({ stage }) {
           {pct}%
         </p>
       </div>
-      <style>{`@keyframes float { 0%,100%{transform:translateY(0) scale(1)} 50%{transform:translateY(-8px) scale(1.05)} }`}</style>
+      <style>{`@keyframes float{0%,100%{transform:translateY(0) scale(1)}50%{transform:translateY(-8px) scale(1.05)}}`}</style>
     </div>
   );
 }
 
-// ─── Screen: Results ─────────────────────────────────────────────────────────────────────────
-function ResultsScreen({ analysis, onReset, cardRef }) {
+// ─── Screen: Results ──────────────────────────────────────────────────────────
+function ResultsScreen({ analysis, onLogout, cardRef }) {
   const { dims, primary, secondary, genreDNA, moodSpectrum, stats } = analysis;
   const [sharing, setSharing] = useState(false);
   const [shareMsg, setShareMsg] = useState("");
@@ -1203,7 +1064,7 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
           document.head.appendChild(s);
         });
       }
-      setShareMsg("Capturing...");
+      setShareMsg("Capturing card...");
       const canvas = await window.html2canvas(cardRef.current, {
         scale: 2.5,
         useCORS: true,
@@ -1217,8 +1078,8 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
       a.click();
       setShareMsg("");
     } catch (e) {
-      setShareMsg(`Failed: ${e.message}`);
-      setTimeout(() => setShareMsg(""), 3000);
+      setShareMsg(`Error: ${e.message}`);
+      setTimeout(() => setShareMsg(""), 3500);
     }
     setSharing(false);
   }
@@ -1228,8 +1089,8 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
       style={{
         minHeight: "100vh",
         background:
-          "radial-gradient(ellipse at 20% 15%, #1e0b3d 0%, #0b0b18 55%, #0a1628 100%)",
-        fontFamily: "'Space Mono', monospace",
+          "radial-gradient(ellipse at 20% 15%,#1e0b3d 0%,#0b0b18 55%,#0a1628 100%)",
+        fontFamily: "'Space Mono',monospace",
         padding: "20px 16px 52px",
       }}
     >
@@ -1241,7 +1102,7 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
           width: 600,
           height: 600,
           borderRadius: "50%",
-          background: `radial-gradient(circle, ${primary.color}14 0%, transparent 65%)`,
+          background: `radial-gradient(circle,${primary.color}14 0%,transparent 65%)`,
           pointerEvents: "none",
           zIndex: 0,
         }}
@@ -1255,6 +1116,7 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
           zIndex: 1,
         }}
       >
+        {/* Topbar */}
         <div
           style={{
             display: "flex",
@@ -1266,19 +1128,19 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
           <span
             style={{
               fontSize: 12,
-              color: "rgba(255,255,255,0.3)",
+              color: "rgba(255,255,255,.3)",
               letterSpacing: 2,
             }}
           >
             MUSIC<span style={{ color: primary.color }}>DNA</span>
           </span>
           <button
-            onClick={onReset}
+            onClick={onLogout}
             style={{
-              background: "rgba(255,255,255,0.05)",
-              border: "1px solid rgba(255,255,255,0.11)",
+              background: "rgba(255,255,255,.05)",
+              border: "1px solid rgba(255,255,255,.11)",
               borderRadius: 7,
-              color: "rgba(255,255,255,0.4)",
+              color: "rgba(255,255,255,.4)",
               fontSize: 10,
               padding: "7px 13px",
               cursor: "pointer",
@@ -1286,7 +1148,7 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
               letterSpacing: 1,
             }}
           >
-            ↩ NEW ANALYSIS
+            ↩ LOG OUT
           </button>
         </div>
 
@@ -1295,17 +1157,16 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
           ref={cardRef}
           style={{
             background:
-              "linear-gradient(148deg, #0d0b1e 0%, #12082a 45%, #08101f 100%)",
+              "linear-gradient(148deg,#0d0b1e 0%,#12082a 45%,#08101f 100%)",
             border: `1px solid ${primary.color}25`,
             borderRadius: 22,
             padding: "28px 26px",
             marginBottom: 14,
-            boxShadow: `0 0 90px ${primary.color}16, 0 0 28px rgba(0,0,0,0.85), inset 0 1px 0 rgba(255,255,255,0.04)`,
+            boxShadow: `0 0 90px ${primary.color}16,0 0 28px rgba(0,0,0,.85),inset 0 1px 0 rgba(255,255,255,.04)`,
             position: "relative",
             overflow: "hidden",
           }}
         >
-          {/* Glow */}
           <div
             style={{
               position: "absolute",
@@ -1314,7 +1175,7 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
               width: 450,
               height: 450,
               borderRadius: "50%",
-              background: `radial-gradient(circle, ${primary.color}14 0%, transparent 65%)`,
+              background: `radial-gradient(circle,${primary.color}14 0%,transparent 65%)`,
               pointerEvents: "none",
             }}
           />
@@ -1326,12 +1187,12 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
               width: 320,
               height: 320,
               borderRadius: "50%",
-              background: `radial-gradient(circle, ${secondary.color}0b 0%, transparent 65%)`,
+              background: `radial-gradient(circle,${secondary.color}0b 0%,transparent 65%)`,
               pointerEvents: "none",
             }}
           />
 
-          {/* ── ARCHETYPE HERO ── */}
+          {/* Archetype Hero */}
           <div
             style={{
               textAlign: "center",
@@ -1365,8 +1226,8 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
                 margin: "0 0 8px",
                 fontSize: 29,
                 color: "white",
-                fontWeight: "700",
-                letterSpacing: "-0.5px",
+                fontWeight: 700,
+                letterSpacing: "-.5px",
                 textShadow: `0 0 42px ${primary.color}44`,
               }}
             >
@@ -1374,7 +1235,7 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
             </h2>
             <p
               style={{
-                color: "rgba(255,255,255,0.42)",
+                color: "rgba(255,255,255,.42)",
                 fontSize: 13,
                 fontStyle: "italic",
                 margin: "0 0 12px",
@@ -1384,32 +1245,32 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
             </p>
             <p
               style={{
-                color: "rgba(255,255,255,0.65)",
+                color: "rgba(255,255,255,.65)",
                 fontSize: 12,
                 lineHeight: 1.78,
                 maxWidth: 430,
                 margin: "0 auto",
               }}
             >
-              {primary.description}
+              {primary.desc}
             </p>
           </div>
 
-          {/* ── MOOD SPECTRUM ── */}
+          {/* Mood Spectrum */}
           <div
             style={{
-              background: "rgba(0,0,0,0.32)",
+              background: "rgba(0,0,0,.32)",
               borderRadius: 16,
               padding: "16px 18px",
               marginBottom: 13,
-              border: "1px solid rgba(255,255,255,0.04)",
+              border: "1px solid rgba(255,255,255,.04)",
             }}
           >
             <div
               style={{
                 fontSize: 8.5,
                 letterSpacing: 3,
-                color: "rgba(255,255,255,0.28)",
+                color: "rgba(255,255,255,.28)",
                 marginBottom: 12,
                 textAlign: "center",
               }}
@@ -1421,7 +1282,7 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
             </div>
           </div>
 
-          {/* ── GENRE DNA + DIMENSIONS (side by side) ── */}
+          {/* Genre DNA + Dimensions */}
           <div
             style={{
               display: "grid",
@@ -1432,17 +1293,17 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
           >
             <div
               style={{
-                background: "rgba(0,0,0,0.32)",
+                background: "rgba(0,0,0,.32)",
                 borderRadius: 16,
                 padding: "14px 13px",
-                border: "1px solid rgba(255,255,255,0.04)",
+                border: "1px solid rgba(255,255,255,.04)",
               }}
             >
               <div
                 style={{
                   fontSize: 8.5,
                   letterSpacing: 3,
-                  color: "rgba(255,255,255,0.28)",
+                  color: "rgba(255,255,255,.28)",
                   marginBottom: 12,
                 }}
               >
@@ -1452,17 +1313,17 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
             </div>
             <div
               style={{
-                background: "rgba(0,0,0,0.32)",
+                background: "rgba(0,0,0,.32)",
                 borderRadius: 16,
                 padding: "14px 13px",
-                border: "1px solid rgba(255,255,255,0.04)",
+                border: "1px solid rgba(255,255,255,.04)",
               }}
             >
               <div
                 style={{
                   fontSize: 8.5,
                   letterSpacing: 3,
-                  color: "rgba(255,255,255,0.28)",
+                  color: "rgba(255,255,255,.28)",
                   marginBottom: 12,
                 }}
               >
@@ -1480,10 +1341,10 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
             </div>
           </div>
 
-          {/* ── ALTER EGO ── */}
+          {/* Alter Ego */}
           <div
             style={{
-              background: `linear-gradient(135deg, ${secondary.color}0d 0%, rgba(0,0,0,0.28) 100%)`,
+              background: `linear-gradient(135deg,${secondary.color}0d 0%,rgba(0,0,0,.28) 100%)`,
               border: `1px solid ${secondary.color}22`,
               borderRadius: 16,
               padding: "15px 17px",
@@ -1494,7 +1355,7 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
               style={{
                 fontSize: 8.5,
                 letterSpacing: 3,
-                color: "rgba(255,255,255,0.28)",
+                color: "rgba(255,255,255,.28)",
                 marginBottom: 11,
               }}
             >
@@ -1523,7 +1384,7 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
                 </div>
                 <div
                   style={{
-                    color: "rgba(255,255,255,0.52)",
+                    color: "rgba(255,255,255,.52)",
                     fontSize: 11,
                     lineHeight: 1.68,
                   }}
@@ -1538,11 +1399,11 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
             </div>
           </div>
 
-          {/* ── STATS ── */}
+          {/* Stats Strip */}
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "repeat(3, 1fr)",
+              gridTemplateColumns: "repeat(3,1fr)",
               gap: 8,
               marginBottom: 14,
             }}
@@ -1569,18 +1430,18 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
               <div
                 key={s.label}
                 style={{
-                  background: "rgba(0,0,0,0.32)",
+                  background: "rgba(0,0,0,.32)",
                   borderRadius: 12,
                   padding: "10px 8px 9px",
                   textAlign: "center",
-                  border: "1px solid rgba(255,255,255,0.04)",
+                  border: "1px solid rgba(255,255,255,.04)",
                 }}
               >
                 <div style={{ fontSize: 13, marginBottom: 3 }}>{s.icon}</div>
                 <div
                   style={{
                     fontSize: 8,
-                    color: "rgba(255,255,255,0.28)",
+                    color: "rgba(255,255,255,.28)",
                     letterSpacing: 2,
                     marginBottom: 4,
                   }}
@@ -1605,7 +1466,7 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
             style={{
               textAlign: "center",
               fontSize: 8.5,
-              color: "rgba(255,255,255,0.13)",
+              color: "rgba(255,255,255,.13)",
               letterSpacing: 3,
             }}
           >
@@ -1613,7 +1474,7 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
           </div>
         </div>
 
-        {/* ── SHARE BUTTON ── */}
+        {/* Share Button */}
         <button
           onClick={handleShare}
           disabled={sharing}
@@ -1621,9 +1482,6 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
             width: "100%",
             padding: "14px",
             fontFamily: "Space Mono",
-            background: sharing
-              ? "rgba(124,58,237,0.4)"
-              : "linear-gradient(135deg, #7c3aed, #4f46e5)",
             border: "none",
             borderRadius: 13,
             color: "white",
@@ -1631,9 +1489,12 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
             fontWeight: "bold",
             letterSpacing: 2,
             cursor: sharing ? "wait" : "pointer",
-            boxShadow: "0 0 42px rgba(124,58,237,0.48)",
             marginBottom: 8,
-            transition: "all 0.3s",
+            background: sharing
+              ? "rgba(124,58,237,.4)"
+              : "linear-gradient(135deg,#7c3aed,#4f46e5)",
+            boxShadow: "0 0 42px rgba(124,58,237,.48)",
+            transition: "all .3s",
           }}
         >
           {sharing
@@ -1644,7 +1505,7 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
           style={{
             textAlign: "center",
             fontSize: 9.5,
-            color: "rgba(255,255,255,0.18)",
+            color: "rgba(255,255,255,.18)",
             letterSpacing: 1,
             margin: 0,
           }}
@@ -1655,15 +1516,15 @@ function ResultsScreen({ analysis, onReset, cardRef }) {
 
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&display=swap');
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        ::-webkit-scrollbar { width: 4px; }
-        ::-webkit-scrollbar-thumb { background: rgba(157,78,237,0.4); border-radius: 2px; }
+        *{box-sizing:border-box;margin:0;padding:0;}
+        ::-webkit-scrollbar{width:4px;}
+        ::-webkit-scrollbar-thumb{background:rgba(157,78,237,.4);border-radius:2px;}
       `}</style>
     </div>
   );
 }
 
-// ─── Error Screen ────────────────────────────────────────────────────────────────────────────
+// ─── Error Screen ─────────────────────────────────────────────────────────────
 function ErrorScreen({ message, onRetry }) {
   return (
     <div
@@ -1692,8 +1553,8 @@ function ErrorScreen({ message, onRetry }) {
         <button
           onClick={onRetry}
           style={{
-            background: "rgba(255,255,255,0.07)",
-            border: "1px solid rgba(255,255,255,0.13)",
+            background: "rgba(255,255,255,.07)",
+            border: "1px solid rgba(255,255,255,.13)",
             borderRadius: 9,
             color: "white",
             padding: "10px 22px",
@@ -1709,74 +1570,80 @@ function ErrorScreen({ message, onRetry }) {
   );
 }
 
-// ─── App Root ────────────────────────────────────────────────────────────────────────────────
+// ─── Read URL params once (outside component — pure, no hooks) ────────────────
+function getInitialState() {
+  const p = new URLSearchParams(window.location.search);
+  const code = p.get("code");
+  const err = p.get("error");
+  if (err)
+    return {
+      screen: "error",
+      error: `Spotify auth denied: ${err}`,
+      code: null,
+    };
+  if (code) return { screen: "loading", error: null, code };
+  return { screen: "login", error: null, code: null };
+}
+
+// ─── App Root ─────────────────────────────────────────────────────────────────
 export default function App() {
-  const [screen, setScreen] = useState("setup");
-  const [loadStage, setStage] = useState(0);
+  // Lazy-initialise from URL so we never call setState synchronously inside an effect
+  const [init] = useState(getInitialState);
+  const [screen, setScreen] = useState(init.screen);
+  const [stage, setStage] = useState(0);
   const [analysis, setAnalysis] = useState(null);
-  const [error, setError] = useState(null);
+  const [error, setError] = useState(init.error);
   const cardRef = useRef(null);
   const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // Handle OAuth callback on page load
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const code = params.get("code");
-    const verifier = sessionStorage.getItem("pkce_verifier");
-    const clientId = sessionStorage.getItem("spotify_client_id");
-    if (code && verifier && clientId) {
-      window.history.replaceState({}, "", window.location.pathname);
-      runAnalysis(code, clientId, verifier);
-    }
-  }, []);
-
-  async function runAnalysis(code, clientId, verifier) {
+  const runAnalysis = useCallback(async (code) => {
     setScreen("loading");
     setStage(0);
     try {
-      const { access_token } = await exchangeCodeForToken(
-        code,
-        clientId,
-        verifier,
-      );
+      const { access_token } = await exchangeToken(code);
       setStage(1);
       const { tracks, artists, features } =
-        await fetchAllListeningData(access_token);
+        await fetchListeningData(access_token);
       setStage(3);
-      await delay(450);
+      await delay(400);
       setStage(4);
       const result = analyzeAll(tracks, artists, features);
       setStage(5);
-      await delay(550);
+      await delay(500);
       setAnalysis(result);
       setScreen("results");
     } catch (e) {
       setError(e.message);
       setScreen("error");
     }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // No useEffect — avoids react-hooks/set-state-in-effect entirely.
+  // Ref guard ensures we fire exactly once; microtask defers past current render.
+  const didRun = useRef(false);
+  if (init.code && !didRun.current) {
+    didRun.current = true;
+    window.history.replaceState({}, "", window.location.pathname);
+    Promise.resolve().then(() => runAnalysis(init.code));
   }
 
-  function handleConnect(clientId) {
-    setError(null);
-    initiateAuth(clientId);
-  }
-  function handleReset() {
+  function handleLogout() {
     sessionStorage.clear();
     setAnalysis(null);
     setError(null);
-    setScreen("setup");
+    setScreen("login");
   }
 
   if (screen === "error")
-    return <ErrorScreen message={error} onRetry={handleReset} />;
-  if (screen === "loading") return <LoadingScreen stage={loadStage} />;
+    return <ErrorScreen message={error} onRetry={handleLogout} />;
+  if (screen === "loading") return <LoadingScreen stage={stage} />;
   if (screen === "results" && analysis)
     return (
       <ResultsScreen
         analysis={analysis}
-        onReset={handleReset}
+        onLogout={handleLogout}
         cardRef={cardRef}
       />
     );
-  return <SetupScreen onConnect={handleConnect} />;
+  return <LoginScreen onLogin={initiateLogin} noClientId={!CLIENT_ID} />;
 }
