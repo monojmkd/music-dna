@@ -78,12 +78,9 @@ async function fetchListeningData(token) {
     spGet("/me/top/tracks?limit=50&time_range=medium_term", token),
     spGet("/me/top/artists?limit=50&time_range=medium_term", token),
   ]);
-  const tracks = tracksRes.items || [];
-  const artists = artistsRes.items || [];
-  const ids = tracks.map((t) => t.id).join(",");
-  const featRes = await spGet(`/audio-features?ids=${ids}`, token);
-  const features = (featRes.audio_features || []).filter(Boolean);
-  return { tracks, artists, features };
+  // audio-features endpoint removed (Spotify 403 for new apps since late 2024)
+  // all personality dims now derived purely from genres + track metadata
+  return { tracks: tracksRes.items || [], artists: artistsRes.items || [] };
 }
 
 // ─── Personality Engine ───────────────────────────────────────────────────────
@@ -268,25 +265,135 @@ const ARCHETYPES = [
 ];
 
 const mean = (a) => (a.length ? a.reduce((s, v) => s + v, 0) / a.length : 0);
-const stddev = (a) => {
-  if (a.length < 2) return 0;
-  const m = mean(a);
-  return Math.sqrt(mean(a.map((x) => (x - m) ** 2)));
-};
 const clamp = (v, lo = 0, hi = 100) => Math.max(lo, Math.min(hi, v));
 
-function scoreDimensions(tracks, artists, features) {
-  const val = features.map((f) => f.valence);
-  const nrg = features.map((f) => f.energy);
-  const dnc = features.map((f) => f.danceability);
-  const aco = features.map((f) => f.acousticness);
-  const ins = features.map((f) => f.instrumentalness);
-  const sph = features.map((f) => f.speechiness);
-  const tmp = features.map((f) => f.tempo);
+// Genre keyword lists — each dimension has "positive" signal genres
+const GK = {
+  // Emotionality → sad, dark, melancholic genres
+  emotional: [
+    "emo",
+    "sad",
+    "melanchol",
+    "heartbreak",
+    "grief",
+    "blues",
+    "soul",
+    "cry",
+    "depression",
+    "slowcore",
+    "blackgaze",
+    "darkwave",
+    "post-punk",
+    "doom",
+    "shoegaze",
+    "chamber",
+  ],
+  // Drive → high-energy genres
+  drive: [
+    "metal",
+    "punk",
+    "hardcore",
+    "drum and bass",
+    "dnb",
+    "speedcore",
+    "grindcore",
+    "thrash",
+    "hip hop",
+    "rap",
+    "trap",
+    "drill",
+    "edm",
+    "house",
+    "techno",
+    "trance",
+    "dubstep",
+    "funk",
+  ],
+  // Sociability → crowd / party genres
+  social: [
+    "pop",
+    "dance",
+    "latin",
+    "reggaeton",
+    "k-pop",
+    "j-pop",
+    "dancehall",
+    "club",
+    "party",
+    "afrobeats",
+    "disco",
+    "hip hop",
+    "rap",
+    "tropical",
+  ],
+  // Nostalgia → old-era genre tags
+  nostalgia: [
+    "classic",
+    "oldies",
+    "retro",
+    "70s",
+    "80s",
+    "90s",
+    "vintage",
+    "motown",
+    "doo-wop",
+    "swing",
+    "big band",
+    "rockabilly",
+    "soul",
+    "blues",
+  ],
+  // Ether → instrumental/ambient/dreamy
+  ether: [
+    "ambient",
+    "instrumental",
+    "post-rock",
+    "neoclassical",
+    "new age",
+    "sleep",
+    "drone",
+    "atmospheric",
+    "shoegaze",
+    "chillwave",
+    "lo-fi",
+    "vaporwave",
+    "dream pop",
+    "ethereal",
+  ],
+  // Chaos → genre-blend / experimental / boundary-breaking
+  chaos: [
+    "experimental",
+    "avant",
+    "noise",
+    "glitch",
+    "free jazz",
+    "math rock",
+    "microtonal",
+    "no wave",
+    "industrial",
+    "post-",
+    "art punk",
+    "skronk",
+    "weird",
+  ],
+};
+
+// Returns 0-1: fraction of all genre tags matching any keyword in list
+function genreSignal(allGenres, keywords) {
+  if (!allGenres.length) return 0;
+  return (
+    allGenres.filter((g) => keywords.some((k) => g.toLowerCase().includes(k)))
+      .length / allGenres.length
+  );
+}
+
+function scoreDimensions(tracks, artists) {
   const pop = tracks.map((t) => t.popularity);
   const yrs = tracks.map((t) =>
     parseInt((t.album?.release_date || "2020").slice(0, 4)),
   );
+  // artist follower counts → proxy for underground-ness
+  const followers = artists.map((a) => a.followers?.total || 0);
 
   const allGenres = artists.flatMap((a) => a.genres || []);
   const genreCounts = {};
@@ -294,7 +401,7 @@ function scoreDimensions(tracks, artists, features) {
   const uniqueCount = Object.keys(genreCounts).length;
   const totalG = allGenres.length || 1;
 
-  // Shannon entropy → genre breadth
+  // Shannon entropy → spread of genre distribution
   let shannonH = 0;
   for (const c of Object.values(genreCounts)) {
     const p = c / totalG;
@@ -305,35 +412,52 @@ function scoreDimensions(tracks, artists, features) {
     shannonH / Math.log2(Math.max(uniqueCount, 2)),
   );
 
-  const socialWords = [
-    "pop",
-    "hip hop",
-    "rap",
-    "dance",
-    "latin",
-    "reggaeton",
-    "k-pop",
-    "club",
-  ];
-  const socialBonus =
-    allGenres.filter((g) => socialWords.some((w) => g.includes(w))).length /
-    totalG;
-
+  // 1. EMOTIONALITY — emotional genre affinity + inverse popularity (emotional music less charted)
   const EQ = clamp(
-    (1 - mean(val)) * 100 + (mean(features.map((f) => f.mode)) < 0.4 ? 8 : 0),
+    genreSignal(allGenres, GK.emotional) * 70 + (1 - mean(pop) / 100) * 20 + 10, // baseline
   );
-  const Entropy = clamp(stddev(nrg) * 175 + genreEntropy * 48);
-  const Social = clamp(mean(dnc) * 70 + socialBonus * 30);
+
+  // 2. CHAOS — Shannon entropy of genre distribution + experimental genre signal
+  const Entropy = clamp(
+    genreEntropy * 60 + genreSignal(allGenres, GK.chaos) * 40,
+  );
+
+  // 3. SOCIABILITY — party/social genre signal + mainstream popularity
+  const Social = clamp(
+    genreSignal(allGenres, GK.social) * 65 + (mean(pop) / 100) * 35,
+  );
+
+  // 4. NOSTALGIA — release year delta + old-era genre tags
   const avgYear = mean(yrs);
   const Nostalgia = clamp(
-    (Math.max(0, 2024 - avgYear) / 28) * 82 + (mean(aco) > 0.5 ? 12 : 0),
+    (Math.max(0, 2024 - avgYear) / 30) * 75 +
+      genreSignal(allGenres, GK.nostalgia) * 25,
   );
+
+  // 5. EXPLORATION — genre diversity + underground bias (low popularity + low follower counts)
+  const medianFollowers =
+    followers.sort((a, b) => a - b)[Math.floor(followers.length / 2)] || 1;
+  const underground = clamp(1 - Math.log10(Math.max(medianFollowers, 1)) / 8); // log scale 0-100M
   const Explore = clamp(
-    (Math.min(uniqueCount, 30) / 30) * 55 + (1 - mean(pop) / 100) * 45,
+    (Math.min(uniqueCount, 35) / 35) * 50 +
+      underground * 30 +
+      (1 - mean(pop) / 100) * 20,
   );
+
+  // 6. MAINSTREAM — raw Spotify popularity (0-100)
   const Pop = clamp(mean(pop));
-  const Drive = clamp(((mean(tmp) - 60) / 140) * 50 + mean(nrg) * 50);
-  const Ether = clamp(mean(ins) * 55 + mean(aco) * 30 - mean(sph) * 25 + 18);
+
+  // 7. DRIVE / INTENSITY — high-energy genre signal + inverse nostalgia (new + fast)
+  const Drive = clamp(
+    genreSignal(allGenres, GK.drive) * 72 +
+      (1 - Math.max(0, 2024 - avgYear) / 30) * 28,
+  );
+
+  // 8. ETHER / DREAMINESS — ambient/instrumental genre signal
+  const Ether = clamp(
+    genreSignal(allGenres, GK.ether) * 75 +
+      (1 - genreSignal(allGenres, GK.social)) * 25,
+  );
 
   return {
     emotionality: Math.round(EQ),
@@ -402,18 +526,18 @@ function buildMoodSpectrum(dims) {
   ];
 }
 
-function analyzeAll(tracks, artists, features) {
-  const dims = scoreDimensions(tracks, artists, features);
+function analyzeAll(tracks, artists) {
+  const dims = scoreDimensions(tracks, artists);
   const { primary, secondary } = classifyArchetype(dims);
   const genreDNA = buildGenreDNA(artists);
   const moodSpectrum = buildMoodSpectrum(dims);
   const stats = {
-    bpm: Math.round(mean(features.map((f) => f.tempo))),
-    energy: Math.round(mean(features.map((f) => f.energy)) * 100),
-    mood: Math.round(mean(features.map((f) => f.valence)) * 100),
+    popularity: Math.round(mean(tracks.map((t) => t.popularity))),
     topArtist: artists[0]?.name || "—",
     topTrack: tracks[0]?.name || "—",
     uniqueGenres: [...new Set(artists.flatMap((a) => a.genres || []))].length,
+    tracksScored: tracks.length,
+    topGenre: buildGenreDNA(artists)[0]?.name || "—",
   };
   return { dims, primary, secondary, genreDNA, moodSpectrum, stats };
 }
@@ -952,7 +1076,7 @@ function LoadingScreen({ stage }) {
   const stages = [
     { label: "Connecting to Spotify...", icon: "🔑" },
     { label: "Fetching your top tracks...", icon: "🎵" },
-    { label: "Analysing audio features...", icon: "🔬" },
+    { label: "Analysing your genre fingerprint...", icon: "🔬" },
     { label: "Scoring personality dimensions...", icon: "🧠" },
     { label: "Classifying your archetype...", icon: "🎭" },
     { label: "Rendering your profile...", icon: "✨" },
@@ -1409,9 +1533,9 @@ function ResultsScreen({ analysis, onLogout, cardRef }) {
             }}
           >
             {[
-              { label: "AVG BPM", val: stats.bpm, icon: "🥁" },
-              { label: "ENERGY", val: `${stats.energy}%`, icon: "⚡" },
-              { label: "MOOD", val: `${stats.mood}%`, icon: "💜" },
+              { label: "POPULARITY", val: stats.popularity, icon: "📈" },
+              { label: "TOP GENRE", val: stats.topGenre, icon: "🎸" },
+              { label: "GENRES", val: `${stats.uniqueGenres}`, icon: "🌐" },
               {
                 label: "TOP ARTIST",
                 val: stats.topArtist.split(" ").slice(0, 2).join(" "),
@@ -1425,7 +1549,7 @@ function ResultsScreen({ analysis, onLogout, cardRef }) {
                     : stats.topTrack,
                 icon: "🎵",
               },
-              { label: "GENRES", val: `${stats.uniqueGenres}+`, icon: "🌐" },
+              { label: "TRACKS", val: `${stats.tracksScored}`, icon: "💿" },
             ].map((s) => (
               <div
                 key={s.label}
@@ -1602,12 +1726,11 @@ export default function App() {
     try {
       const { access_token } = await exchangeToken(code);
       setStage(1);
-      const { tracks, artists, features } =
-        await fetchListeningData(access_token);
+      const { tracks, artists } = await fetchListeningData(access_token);
       setStage(3);
       await delay(400);
       setStage(4);
-      const result = analyzeAll(tracks, artists, features);
+      const result = analyzeAll(tracks, artists);
       setStage(5);
       await delay(500);
       setAnalysis(result);
@@ -1616,12 +1739,11 @@ export default function App() {
       setError(e.message);
       setScreen("error");
     }
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
 
-  // No useEffect — avoids react-hooks/set-state-in-effect entirely.
-  // Ref guard ensures we fire exactly once; microtask defers past current render.
-  const didRun = useRef(false);
-  if (init.code && !didRun.current) {
+  // One-time init — linter-approved pattern: `ref.current == null` is allowed during render
+  const didRun = useRef(null);
+  if (init.code && didRun.current == null) {
     didRun.current = true;
     window.history.replaceState({}, "", window.location.pathname);
     Promise.resolve().then(() => runAnalysis(init.code));
