@@ -132,12 +132,39 @@ const GENRE_MAP = {
   piano: "Classical & Ambient",
   instrumental: "Classical & Ambient",
   "new age": "Classical & Ambient",
+  carnatic: "Classical & Ambient",
+  hindustani: "Classical & Ambient",
+  raga: "Classical & Ambient",
+  ghazal: "Classical & Ambient",
+  qawwali: "Classical & Ambient",
   pop: "Pop",
   latin: "Pop",
   "k-pop": "Pop",
   "j-pop": "Pop",
   reggaeton: "Pop",
   dancehall: "Pop",
+  // Indian / South Asian / Regional
+  bollywood: "Bollywood & World",
+  filmi: "Bollywood & World",
+  hindi: "Bollywood & World",
+  "indian pop": "Bollywood & World",
+  kollywood: "Bollywood & World",
+  tollywood: "Bollywood & World",
+  bhangra: "Bollywood & World",
+  assamese: "Bollywood & World",
+  bengali: "Bollywood & World",
+  marathi: "Bollywood & World",
+  punjabi: "Bollywood & World",
+  tamil: "Bollywood & World",
+  telugu: "Bollywood & World",
+  kannada: "Bollywood & World",
+  malayalam: "Bollywood & World",
+  devotional: "Bollywood & World",
+  bhajan: "Bollywood & World",
+  sufi: "Bollywood & World",
+  world: "Bollywood & World",
+  afrobeat: "Bollywood & World",
+  reggae: "Bollywood & World",
 };
 
 const GENRE_COLORS = {
@@ -148,6 +175,7 @@ const GENRE_COLORS = {
   "Acoustic & Folk": "#7bed9f",
   "Classical & Ambient": "#a29bfe",
   Pop: "#fd79a8",
+  "Bollywood & World": "#f7931e",
   Other: "#636e72",
 };
 
@@ -267,9 +295,8 @@ const ARCHETYPES = [
 const mean = (a) => (a.length ? a.reduce((s, v) => s + v, 0) / a.length : 0);
 const clamp = (v, lo = 0, hi = 100) => Math.max(lo, Math.min(hi, v));
 
-// Genre keyword lists — each dimension has "positive" signal genres
+// Genre keyword lists — broad enough to catch Spotify's raw genre strings
 const GK = {
-  // Emotionality → sad, dark, melancholic genres
   emotional: [
     "emo",
     "sad",
@@ -278,8 +305,6 @@ const GK = {
     "grief",
     "blues",
     "soul",
-    "cry",
-    "depression",
     "slowcore",
     "blackgaze",
     "darkwave",
@@ -287,8 +312,18 @@ const GK = {
     "doom",
     "shoegaze",
     "chamber",
+    "ballad",
+    "ghazal",
+    "qawwali",
+    "sufi",
+    "thumri",
+    "carnatic",
+    "devotional",
+    "bhajan",
+    "filmi",
+    "bollywood sad",
+    "indie sad",
   ],
-  // Drive → high-energy genres
   drive: [
     "metal",
     "punk",
@@ -296,7 +331,6 @@ const GK = {
     "drum and bass",
     "dnb",
     "speedcore",
-    "grindcore",
     "thrash",
     "hip hop",
     "rap",
@@ -308,8 +342,13 @@ const GK = {
     "trance",
     "dubstep",
     "funk",
+    "bhangra",
+    "garba",
+    "dandiya",
+    "workout",
+    "gym",
+    "hype",
   ],
-  // Sociability → crowd / party genres
   social: [
     "pop",
     "dance",
@@ -319,14 +358,19 @@ const GK = {
     "j-pop",
     "dancehall",
     "club",
-    "party",
     "afrobeats",
     "disco",
     "hip hop",
     "rap",
     "tropical",
+    "filmi",
+    "bollywood",
+    "indian pop",
+    "hindi pop",
+    "kollywood",
+    "tollywood",
+    "party",
   ],
-  // Nostalgia → old-era genre tags
   nostalgia: [
     "classic",
     "oldies",
@@ -336,14 +380,16 @@ const GK = {
     "90s",
     "vintage",
     "motown",
-    "doo-wop",
     "swing",
-    "big band",
     "rockabilly",
     "soul",
     "blues",
+    "golden era",
+    "old school",
+    "hindustani classic",
+    "carnatic classic",
+    "golden bollywood",
   ],
-  // Ether → instrumental/ambient/dreamy
   ether: [
     "ambient",
     "instrumental",
@@ -359,8 +405,11 @@ const GK = {
     "vaporwave",
     "dream pop",
     "ethereal",
+    "meditation",
+    "healing",
+    "raga",
+    "classical",
   ],
-  // Chaos → genre-blend / experimental / boundary-breaking
   chaos: [
     "experimental",
     "avant",
@@ -371,14 +420,14 @@ const GK = {
     "microtonal",
     "no wave",
     "industrial",
-    "post-",
     "art punk",
-    "skronk",
-    "weird",
+    "fusion",
+    "world",
+    "crossover",
+    "eclectic",
   ],
 };
 
-// Returns 0-1: fraction of all genre tags matching any keyword in list
 function genreSignal(allGenres, keywords) {
   if (!allGenres.length) return 0;
   return (
@@ -392,7 +441,6 @@ function scoreDimensions(tracks, artists) {
   const yrs = tracks.map((t) =>
     parseInt((t.album?.release_date || "2020").slice(0, 4)),
   );
-  // artist follower counts → proxy for underground-ness
   const followers = artists.map((a) => a.followers?.total || 0);
 
   const allGenres = artists.flatMap((a) => a.genres || []);
@@ -412,52 +460,64 @@ function scoreDimensions(tracks, artists) {
     shannonH / Math.log2(Math.max(uniqueCount, 2)),
   );
 
-  // 1. EMOTIONALITY — emotional genre affinity + inverse popularity (emotional music less charted)
-  const EQ = clamp(
-    genreSignal(allGenres, GK.emotional) * 70 + (1 - mean(pop) / 100) * 20 + 10, // baseline
-  );
+  // When genres are sparse (regional artists, new accounts), lean harder on metadata signals
+  const hasGenres = allGenres.length > 0;
+  const avgPop = mean(pop) || 50;
+  const avgYear = mean(yrs) || 2018;
+  const medFollowers =
+    [...followers].sort((a, b) => a - b)[Math.floor(followers.length / 2)] ||
+    1000;
+  // underground score: log10 scale → 0 (100M followers) to 1 (100 followers)
+  const underground = clamp(1 - Math.log10(Math.max(medFollowers, 100)) / 8);
 
-  // 2. CHAOS — Shannon entropy of genre distribution + experimental genre signal
-  const Entropy = clamp(
-    genreEntropy * 60 + genreSignal(allGenres, GK.chaos) * 40,
-  );
+  // Genre signals (0–1), defaulting to metadata proxies when genres absent
+  const sig = {
+    emotional: hasGenres
+      ? genreSignal(allGenres, GK.emotional)
+      : (1 - avgPop / 100) * 0.6,
+    drive: hasGenres ? genreSignal(allGenres, GK.drive) : (avgPop / 100) * 0.5,
+    social: hasGenres
+      ? genreSignal(allGenres, GK.social)
+      : (avgPop / 100) * 0.7,
+    nostalgia: hasGenres ? genreSignal(allGenres, GK.nostalgia) : 0,
+    ether: hasGenres ? genreSignal(allGenres, GK.ether) : underground * 0.4,
+    chaos: hasGenres
+      ? genreSignal(allGenres, GK.chaos)
+      : (uniqueCount / Math.max(artists.length, 1)) * 0.3,
+  };
 
-  // 3. SOCIABILITY — party/social genre signal + mainstream popularity
-  const Social = clamp(
-    genreSignal(allGenres, GK.social) * 65 + (mean(pop) / 100) * 35,
-  );
+  // 1. EMOTIONALITY
+  const EQ = clamp(sig.emotional * 65 + (1 - avgPop / 100) * 22 + 13);
 
-  // 4. NOSTALGIA — release year delta + old-era genre tags
-  const avgYear = mean(yrs);
+  // 2. CHAOS — genre entropy + experimental signal
+  const Entropy = clamp(genreEntropy * 58 + sig.chaos * 32 + 5);
+
+  // 3. SOCIABILITY
+  const Social = clamp(sig.social * 62 + (avgPop / 100) * 33 + 5);
+
+  // 4. NOSTALGIA — release year delta weighted heavily
   const Nostalgia = clamp(
-    (Math.max(0, 2024 - avgYear) / 30) * 75 +
-      genreSignal(allGenres, GK.nostalgia) * 25,
+    (Math.max(0, 2024 - avgYear) / 30) * 70 + sig.nostalgia * 25 + 5,
   );
 
-  // 5. EXPLORATION — genre diversity + underground bias (low popularity + low follower counts)
-  const medianFollowers =
-    followers.sort((a, b) => a - b)[Math.floor(followers.length / 2)] || 1;
-  const underground = clamp(1 - Math.log10(Math.max(medianFollowers, 1)) / 8); // log scale 0-100M
+  // 5. EXPLORATION — diversity + underground
   const Explore = clamp(
-    (Math.min(uniqueCount, 35) / 35) * 50 +
-      underground * 30 +
-      (1 - mean(pop) / 100) * 20,
+    (Math.min(uniqueCount, 35) / 35) * 45 +
+      underground * 35 +
+      (1 - avgPop / 100) * 15 +
+      5,
   );
 
-  // 6. MAINSTREAM — raw Spotify popularity (0-100)
-  const Pop = clamp(mean(pop));
+  // 6. MAINSTREAM
+  const Pop = clamp(avgPop);
 
-  // 7. DRIVE / INTENSITY — high-energy genre signal + inverse nostalgia (new + fast)
+  // 7. DRIVE / INTENSITY
   const Drive = clamp(
-    genreSignal(allGenres, GK.drive) * 72 +
-      (1 - Math.max(0, 2024 - avgYear) / 30) * 28,
+    sig.drive * 68 + (1 - Math.max(0, 2024 - avgYear) / 30) * 27 + 5,
   );
 
-  // 8. ETHER / DREAMINESS — ambient/instrumental genre signal
-  const Ether = clamp(
-    genreSignal(allGenres, GK.ether) * 75 +
-      (1 - genreSignal(allGenres, GK.social)) * 25,
-  );
+  // 8. ETHER / DREAMINESS
+  const Ether = clamp(sig.ether * 70 + (1 - sig.social) * 20 + 5);
 
   return {
     emotionality: Math.round(EQ),
@@ -544,9 +604,9 @@ function analyzeAll(tracks, artists) {
 
 // ─── SVG: Radar Chart ─────────────────────────────────────────────────────────
 function RadarChart({ axes, color }) {
-  const CX = 150,
-    CY = 150,
-    R = 105,
+  const CX = 155,
+    CY = 155,
+    R = 112,
     N = axes.length;
   const ang = (i) => (2 * Math.PI * i) / N - Math.PI / 2;
   const pt = (val, i) => {
@@ -557,11 +617,11 @@ function RadarChart({ axes, color }) {
   const poly = pts.map((p) => p.join(",")).join(" ");
   return (
     <svg
-      viewBox="0 0 300 300"
+      viewBox="0 0 310 310"
       style={{
         width: "100%",
-        maxWidth: 270,
-        filter: `drop-shadow(0 0 20px ${color}44)`,
+        maxWidth: 290,
+        filter: `drop-shadow(0 0 22px ${color}55)`,
       }}
     >
       {[0.25, 0.5, 0.75, 1].map((lvl) => {
@@ -579,7 +639,7 @@ function RadarChart({ axes, color }) {
             key={lvl}
             points={gp}
             fill="none"
-            stroke="rgba(255,255,255,0.07)"
+            stroke="rgba(255,255,255,0.1)"
             strokeWidth="1"
           />
         );
@@ -591,31 +651,31 @@ function RadarChart({ axes, color }) {
           y1={CY}
           x2={CX + R * Math.cos(ang(i))}
           y2={CY + R * Math.sin(ang(i))}
-          stroke="rgba(255,255,255,0.07)"
+          stroke="rgba(255,255,255,0.1)"
           strokeWidth="1"
         />
       ))}
       <polygon
         points={poly}
-        fill={`${color}28`}
+        fill={`${color}30`}
         stroke={color}
         strokeWidth="2.5"
         strokeLinejoin="round"
-        style={{ filter: `drop-shadow(0 0 10px ${color})` }}
+        style={{ filter: `drop-shadow(0 0 12px ${color})` }}
       />
       {pts.map(([x, y], i) => (
         <circle
           key={i}
           cx={x}
           cy={y}
-          r={4.5}
+          r={5}
           fill={color}
-          style={{ filter: `drop-shadow(0 0 6px ${color})` }}
+          style={{ filter: `drop-shadow(0 0 8px ${color})` }}
         />
       ))}
       {axes.map((a, i) => {
-        const lx = CX + (R + 26) * Math.cos(ang(i)),
-          ly = CY + (R + 26) * Math.sin(ang(i));
+        const lx = CX + (R + 28) * Math.cos(ang(i)),
+          ly = CY + (R + 28) * Math.sin(ang(i));
         return (
           <text
             key={i}
@@ -623,8 +683,8 @@ function RadarChart({ axes, color }) {
             y={ly}
             textAnchor="middle"
             dominantBaseline="middle"
-            fill="rgba(255,255,255,0.58)"
-            fontSize="9"
+            fill="rgba(255,255,255,0.82)"
+            fontSize="10"
             fontFamily="'Space Mono',monospace"
             fontWeight="700"
           >
@@ -636,13 +696,12 @@ function RadarChart({ axes, color }) {
         <text
           key={`v${i}`}
           x={x}
-          y={y - 10}
+          y={y - 12}
           textAnchor="middle"
-          fill={color}
-          fontSize="8"
+          fill="white"
+          fontSize="9"
           fontFamily="'Space Mono',monospace"
           fontWeight="700"
-          opacity="0.9"
         >
           {axes[i].value}
         </text>
@@ -781,19 +840,19 @@ function DonutChart({ data }) {
 // ─── Component: Dim Bar ───────────────────────────────────────────────────────
 function DimBar({ label, value, color, icon }) {
   return (
-    <div style={{ marginBottom: 9 }}>
+    <div style={{ marginBottom: 10 }}>
       <div
         style={{
           display: "flex",
           justifyContent: "space-between",
           alignItems: "center",
-          marginBottom: 4,
+          marginBottom: 5,
         }}
       >
         <span
           style={{
-            fontSize: 9.5,
-            color: "rgba(255,255,255,0.5)",
+            fontSize: 10,
+            color: "rgba(255,255,255,0.78)",
             fontFamily: "Space Mono",
             display: "flex",
             gap: 5,
@@ -805,7 +864,7 @@ function DimBar({ label, value, color, icon }) {
         </span>
         <span
           style={{
-            fontSize: 9.5,
+            fontSize: 11,
             color,
             fontFamily: "Space Mono",
             fontWeight: "bold",
@@ -816,8 +875,8 @@ function DimBar({ label, value, color, icon }) {
       </div>
       <div
         style={{
-          height: 3,
-          background: "rgba(255,255,255,0.07)",
+          height: 4,
+          background: "rgba(255,255,255,0.1)",
           borderRadius: 2,
           overflow: "hidden",
         }}
@@ -827,8 +886,8 @@ function DimBar({ label, value, color, icon }) {
             width: `${value}%`,
             height: "100%",
             borderRadius: 2,
-            background: `linear-gradient(90deg,${color}55,${color})`,
-            boxShadow: `0 0 8px ${color}55`,
+            background: `linear-gradient(90deg,${color}66,${color})`,
+            boxShadow: `0 0 10px ${color}77`,
           }}
         />
       </div>
@@ -1336,11 +1395,10 @@ function ResultsScreen({ analysis, onLogout, cardRef }) {
             </div>
             <div
               style={{
-                fontSize: 8.5,
+                fontSize: 9,
                 letterSpacing: 4,
                 color: primary.color,
                 marginBottom: 7,
-                opacity: 0.9,
               }}
             >
               YOUR ARCHETYPE
@@ -1359,7 +1417,7 @@ function ResultsScreen({ analysis, onLogout, cardRef }) {
             </h2>
             <p
               style={{
-                color: "rgba(255,255,255,.42)",
+                color: "rgba(255,255,255,.75)",
                 fontSize: 13,
                 fontStyle: "italic",
                 margin: "0 0 12px",
@@ -1369,7 +1427,7 @@ function ResultsScreen({ analysis, onLogout, cardRef }) {
             </p>
             <p
               style={{
-                color: "rgba(255,255,255,.65)",
+                color: "rgba(255,255,255,.82)",
                 fontSize: 12,
                 lineHeight: 1.78,
                 maxWidth: 430,
@@ -1383,18 +1441,18 @@ function ResultsScreen({ analysis, onLogout, cardRef }) {
           {/* Mood Spectrum */}
           <div
             style={{
-              background: "rgba(0,0,0,.32)",
+              background: "rgba(0,0,0,.4)",
               borderRadius: 16,
               padding: "16px 18px",
               marginBottom: 13,
-              border: "1px solid rgba(255,255,255,.04)",
+              border: "1px solid rgba(255,255,255,.08)",
             }}
           >
             <div
               style={{
-                fontSize: 8.5,
+                fontSize: 9,
                 letterSpacing: 3,
-                color: "rgba(255,255,255,.28)",
+                color: "rgba(255,255,255,.65)",
                 marginBottom: 12,
                 textAlign: "center",
               }}
@@ -1417,17 +1475,17 @@ function ResultsScreen({ analysis, onLogout, cardRef }) {
           >
             <div
               style={{
-                background: "rgba(0,0,0,.32)",
+                background: "rgba(0,0,0,.4)",
                 borderRadius: 16,
                 padding: "14px 13px",
-                border: "1px solid rgba(255,255,255,.04)",
+                border: "1px solid rgba(255,255,255,.08)",
               }}
             >
               <div
                 style={{
-                  fontSize: 8.5,
+                  fontSize: 9,
                   letterSpacing: 3,
-                  color: "rgba(255,255,255,.28)",
+                  color: "rgba(255,255,255,.65)",
                   marginBottom: 12,
                 }}
               >
@@ -1437,17 +1495,17 @@ function ResultsScreen({ analysis, onLogout, cardRef }) {
             </div>
             <div
               style={{
-                background: "rgba(0,0,0,.32)",
+                background: "rgba(0,0,0,.4)",
                 borderRadius: 16,
                 padding: "14px 13px",
-                border: "1px solid rgba(255,255,255,.04)",
+                border: "1px solid rgba(255,255,255,.08)",
               }}
             >
               <div
                 style={{
-                  fontSize: 8.5,
+                  fontSize: 9,
                   letterSpacing: 3,
-                  color: "rgba(255,255,255,.28)",
+                  color: "rgba(255,255,255,.65)",
                   marginBottom: 12,
                 }}
               >
@@ -1468,8 +1526,8 @@ function ResultsScreen({ analysis, onLogout, cardRef }) {
           {/* Alter Ego */}
           <div
             style={{
-              background: `linear-gradient(135deg,${secondary.color}0d 0%,rgba(0,0,0,.28) 100%)`,
-              border: `1px solid ${secondary.color}22`,
+              background: `linear-gradient(135deg,${secondary.color}18 0%,rgba(0,0,0,.35) 100%)`,
+              border: `1px solid ${secondary.color}40`,
               borderRadius: 16,
               padding: "15px 17px",
               marginBottom: 13,
@@ -1477,9 +1535,9 @@ function ResultsScreen({ analysis, onLogout, cardRef }) {
           >
             <div
               style={{
-                fontSize: 8.5,
+                fontSize: 9,
                 letterSpacing: 3,
-                color: "rgba(255,255,255,.28)",
+                color: "rgba(255,255,255,.65)",
                 marginBottom: 11,
               }}
             >
@@ -1508,9 +1566,9 @@ function ResultsScreen({ analysis, onLogout, cardRef }) {
                 </div>
                 <div
                   style={{
-                    color: "rgba(255,255,255,.52)",
+                    color: "rgba(255,255,255,.8)",
                     fontSize: 11,
-                    lineHeight: 1.68,
+                    lineHeight: 1.72,
                   }}
                 >
                   On different nights, with different playlists — you become a{" "}
@@ -1554,18 +1612,18 @@ function ResultsScreen({ analysis, onLogout, cardRef }) {
               <div
                 key={s.label}
                 style={{
-                  background: "rgba(0,0,0,.32)",
+                  background: "rgba(0,0,0,.4)",
                   borderRadius: 12,
                   padding: "10px 8px 9px",
                   textAlign: "center",
-                  border: "1px solid rgba(255,255,255,.04)",
+                  border: "1px solid rgba(255,255,255,.08)",
                 }}
               >
                 <div style={{ fontSize: 13, marginBottom: 3 }}>{s.icon}</div>
                 <div
                   style={{
                     fontSize: 8,
-                    color: "rgba(255,255,255,.28)",
+                    color: "rgba(255,255,255,.55)",
                     letterSpacing: 2,
                     marginBottom: 4,
                   }}
@@ -1590,7 +1648,7 @@ function ResultsScreen({ analysis, onLogout, cardRef }) {
             style={{
               textAlign: "center",
               fontSize: 8.5,
-              color: "rgba(255,255,255,.13)",
+              color: "rgba(255,255,255,.25)",
               letterSpacing: 3,
             }}
           >
@@ -1694,6 +1752,9 @@ function ErrorScreen({ message, onRetry }) {
   );
 }
 
+// Module-level guard — lives outside React, no hook rules apply
+let _initDone = false;
+
 // ─── Read URL params once (outside component — pure, no hooks) ────────────────
 function getInitialState() {
   const p = new URLSearchParams(window.location.search);
@@ -1741,10 +1802,9 @@ export default function App() {
     }
   }, []);
 
-  // One-time init — linter-approved pattern: `ref.current == null` is allowed during render
-  const didRun = useRef(null);
-  if (init.code && didRun.current == null) {
-    didRun.current = true;
+  // Module-level guard fires runAnalysis exactly once, zero React hook rules violated
+  if (init.code && !_initDone) {
+    _initDone = true;
     window.history.replaceState({}, "", window.location.pathname);
     Promise.resolve().then(() => runAnalysis(init.code));
   }
