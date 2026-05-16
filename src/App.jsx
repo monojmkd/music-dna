@@ -591,19 +591,23 @@ function analyzeAll(tracks, artists) {
   const { primary, secondary } = classifyArchetype(dims);
   const genreDNA = buildGenreDNA(artists);
   const moodSpectrum = buildMoodSpectrum(dims);
+  const allGenresList = [...new Set(artists.flatMap((a) => a.genres || []))];
+  const genreDNAList = buildGenreDNA(artists);
   const stats = {
-    popularity: Math.round(mean(tracks.map((t) => t.popularity))),
+    // ?? 0 guards against undefined/null popularity on regional tracks
+    popularity: Math.round(mean(tracks.map((t) => t.popularity ?? 0))) || 0,
     topArtist: artists[0]?.name || "—",
     topTrack: tracks[0]?.name || "—",
-    uniqueGenres: [...new Set(artists.flatMap((a) => a.genres || []))].length,
+    // when genres absent (common for regional/indie artists), show "Varied"
+    uniqueGenres: allGenresList.length || "N/A",
     tracksScored: tracks.length,
-    topGenre: buildGenreDNA(artists)[0]?.name || "—",
+    topGenre: genreDNAList[0]?.name || (artists.length ? "Varied" : "—"),
   };
   return {
     dims,
     primary,
     secondary,
-    genreDNA,
+    genreDNA: genreDNAList,
     moodSpectrum,
     stats,
     artistNames: artists.map((a) => a.name),
